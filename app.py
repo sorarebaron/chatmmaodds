@@ -34,15 +34,16 @@ BG       = "#1a1a1a"
 ORANGE   = "#F6770E"
 GREEN    = "#61B50E"
 WHITE    = "#FFFFFF"
-ROW_ALT  = "#222222"
-DIV_LINE = "#333333"
+SHADE_A  = "#1a1a1a"   # even fight pairs — same as background
+SHADE_B  = "#1d2535"   # odd fight pairs — subtle dark navy tint
+DIV_LINE = "#2e2e2e"
 
 BOOK_PRIORITY = [
     "BetOnline", "DraftKings", "FanDuel",
     "BetMGM", "Caesars", "BetRivers", "Bovada",
 ]
 
-EMPTY_VALS = {"", "–", "—", "-", "N/A", "n/a", "pk", "PK", "even", "EVEN"}
+EMPTY_VALS = {"", "\u2013", "\u2014", "-", "N/A", "n/a", "pk", "PK", "even", "EVEN"}
 PROP_KW    = ["inside distance", "over 1", "over 2", "over 3", "over 4"]
 BOOK_KW    = ["betonline", "bovada", "betmgm", "caesars", "fanduel",
               "draftkings", "betrivers", "mybookie", "pinnacle"]
@@ -65,7 +66,7 @@ def get_font(size: int):
 def fmt_odds(val) -> str:
     """Normalize American odds to +NNN / -NNN or 'n/a'."""
     s = str(val).strip() if val is not None else ""
-    if s in ("", "n/a", "N/A", "nan", "None", "–", "—"):
+    if s in ("", "n/a", "N/A", "nan", "None", "\u2013", "\u2014"):
         return "n/a"
     try:
         n = int(s.replace("+", "").replace(" ", ""))
@@ -118,8 +119,6 @@ def scrape_fightodds(dk_names: list) -> tuple:
     Scrape fightodds.io for the next UFC event.
     Fight 1 = main event (first listed on page).
     Returns (results_dict, status_str).
-      results_dict keyed by DK fighter name:
-        {fight_num, win, itd, rds, ou}
     """
     from playwright.sync_api import sync_playwright
     from rapidfuzz import process as fzp, fuzz
@@ -144,12 +143,13 @@ def scrape_fightodds(dk_names: list) -> tuple:
             ))
 
             # ── Find the next UFC event ──────────────────────────────────────
+            # Use domcontentloaded (faster than networkidle for React SPAs)
             page.goto(
                 "https://fightodds.io/upcoming-mma-events/ufc",
                 timeout=30000
             )
-            page.wait_for_load_state("networkidle", timeout=20000)
-            page.wait_for_timeout(2500)
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+            page.wait_for_timeout(4000)  # let React render
 
             links = page.locator("a[href*='/events/']").all()
             if not links:
@@ -161,8 +161,8 @@ def scrape_fightodds(dk_names: list) -> tuple:
 
             # ── Load event page ──────────────────────────────────────────────
             page.goto(event_url, timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=25000)
-            page.wait_for_timeout(3000)
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+            page.wait_for_timeout(5000)  # let React render odds table
 
             # Try to expand any props sections
             for sel in [
@@ -179,14 +179,13 @@ def scrape_fightodds(dk_names: list) -> tuple:
                             pass
                 except Exception:
                     pass
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(2000)
 
             # ── Extract ALL table rows via JS in page order ──────────────────
             raw = page.evaluate("""
 () => {
     const out = { headers: [], rows: [] };
 
-    // Find the main odds table (contains bookmaker names in <th>)
     for (const tbl of document.querySelectorAll('table')) {
         const ths = [...tbl.querySelectorAll('th')]
             .map(t => t.textContent.trim());
@@ -195,8 +194,6 @@ def scrape_fightodds(dk_names: list) -> tuple:
         );
         if (!hasBooks) continue;
         out.headers = ths;
-
-        // Collect ALL tbody rows in DOM order (fighters + props interleaved)
         for (const row of tbl.querySelectorAll('tbody tr')) {
             const cells = [...row.querySelectorAll('td')]
                 .map(c => c.textContent.trim());
@@ -206,14 +203,11 @@ def scrape_fightodds(dk_names: list) -> tuple:
         break;
     }
 
-    // If no table found, try div-based layout (React SPA fallback)
     if (out.rows.length === 0) {
         const nameEls = document.querySelectorAll(
             '[class*="fighter"] [class*="name"], [class*="fighterName"]'
         );
-        nameEls.forEach(el => {
-            out.rows.push([el.textContent.trim()]);
-        });
+        nameEls.forEach(el => { out.rows.push([el.textContent.trim()]); });
     }
 
     return out;
@@ -234,86 +228,59 @@ def scrape_fightodds(dk_names: list) -> tuple:
                 if b.lower() in h.lower() and b not in book_col:
                     book_col[b] = i
 
-        # ── Process rows sequentially ─────────────────────────────────────────
-        # Group into fight buckets: each bucket has fighter rows + prop rows
-        # fight_num 1 = main event (first pair of fighters encountered)
-        fight_buckets: dict = {}  # fight_num -> {fighters: [], props: []}
-        fight_num  = 0
-        in_fight   = 0  # 0 or 1 (counts fighters seen in current fight)
+        # ── Process rows sequentially into fight buckets ──────────────────────
+        fight_buckets: dict = {}
+        fight_num = 0
+        in_fight  = 0
 
         for row in all_rows:
             if not row or not row[0]:
                 continue
             label   = row[0]
             label_l = label.lower()
-
-            # Skip pure header rows
             if any(bk in label_l for bk in BOOK_KW):
                 continue
-
-            # Prop row?
             is_prop = any(kw in label_l for kw in PROP_KW)
-
             if is_prop:
                 if fight_num > 0:
                     fight_buckets[fight_num]["props"].append(row)
                 continue
-
-            # Fighter row (non-empty, non-header, non-prop)
             if len(label) < 2:
                 continue
-
             if in_fight == 0:
                 fight_num += 1
                 fight_buckets[fight_num] = {"fighters": [], "props": []}
-
             fight_buckets[fight_num]["fighters"].append(row)
             in_fight = (in_fight + 1) % 2
 
         if not fight_buckets:
             raise RuntimeError("Could not identify any fights from extracted rows")
 
-        # ── Extract odds per fighter per fight ────────────────────────────────
-        raw_fighters = []   # {raw_name, fight_num, win, itd, rds, ou}
+        # ── Extract odds per fight ─────────────────────────────────────────────
+        raw_fighters = []
 
         for fn, bucket in fight_buckets.items():
-            # Win odds: from fighter rows
             for row in bucket["fighters"]:
-                odds_map = {
-                    b: row[c]
-                    for b, c in book_col.items()
-                    if c < len(row)
-                }
+                odds_map = {b: row[c] for b, c in book_col.items() if c < len(row)}
                 raw_fighters.append({
-                    "raw_name":  row[0],
-                    "fight_num": fn,
-                    "win":       pick_odds(odds_map),
-                    "itd":       "",
-                    "rds":       "",
-                    "ou":        "",
+                    "raw_name": row[0], "fight_num": fn,
+                    "win": pick_odds(odds_map), "itd": "", "rds": "", "ou": "",
                 })
 
-            # Parse prop rows for this fight
-            itd_for_fight: dict = {}  # fighter_name_lower -> odds
-            ou_candidates: list = []  # (rds_float, odds_str, dist_from_110)
+            itd_for_fight: dict = {}
+            ou_candidates: list = []
 
             for row in bucket["props"]:
                 lbl   = row[0]
                 lbl_l = lbl.lower()
-                odds_map = {
-                    b: row[c]
-                    for b, c in book_col.items()
-                    if c < len(row)
-                }
+                odds_map = {b: row[c] for b, c in book_col.items() if c < len(row)}
                 val = pick_odds(odds_map)
-
                 if "inside distance" in lbl_l:
-                    fighter_part = re.sub(
+                    fp = re.sub(
                         r"\s*wins inside distance.*", "", lbl,
                         flags=re.IGNORECASE
                     ).strip().lower()
-                    itd_for_fight[fighter_part] = val
-
+                    itd_for_fight[fp] = val
                 elif "over" in lbl_l and val:
                     rds = 1.5
                     if "2" in lbl:   rds = 2.5
@@ -325,23 +292,16 @@ def scrape_fightodds(dk_names: list) -> tuple:
                     except Exception:
                         ou_candidates.append((rds, val, 999))
 
-            # Best O/U line: over odds closest to -110
-            best_ou = None
-            if ou_candidates:
-                best_ou = min(ou_candidates, key=lambda x: x[2])
+            best_ou = min(ou_candidates, key=lambda x: x[2]) if ou_candidates else None
 
-            # Attach ITD + O/U to the fighters in this fight
             for entry in raw_fighters:
                 if entry["fight_num"] != fn:
                     continue
                 name_l = entry["raw_name"].lower()
-                # Fuzzy match fighter name to ITD dict
                 if itd_for_fight:
                     best_itd = max(
                         itd_for_fight.keys(),
-                        key=lambda k: sum(
-                            1 for w in k.split() if w in name_l
-                        ),
+                        key=lambda k: sum(1 for w in k.split() if w in name_l),
                         default=None,
                     )
                     if best_itd and any(w in name_l for w in best_itd.split()):
@@ -355,8 +315,7 @@ def scrape_fightodds(dk_names: list) -> tuple:
         for entry in raw_fighters:
             m = fzp.extractOne(
                 entry["raw_name"], dk_names,
-                scorer=fuzz.token_sort_ratio,
-                score_cutoff=85,
+                scorer=fuzz.token_sort_ratio, score_cutoff=85,
             )
             if not m:
                 continue
@@ -370,20 +329,18 @@ def scrape_fightodds(dk_names: list) -> tuple:
             }
             matched += 1
 
-        total       = len(dk_names)
-        miss_itd    = sum(1 for v in results.values() if not v["itd"])
-        miss_ou     = sum(1 for v in results.values() if not v["ou"])
-        status_parts = [f"✅ Scraped {matched}/{total} fighters"]
-        if miss_itd:
-            status_parts.append(f"{miss_itd} ITD values missing")
-        if miss_ou:
-            status_parts.append(f"{miss_ou} O/U values missing")
-        status = " — ".join(status_parts)
+        total    = len(dk_names)
+        miss_itd = sum(1 for v in results.values() if not v["itd"])
+        miss_ou  = sum(1 for v in results.values() if not v["ou"])
+        parts    = [f"\u2705 Scraped {matched}/{total} fighters"]
+        if miss_itd: parts.append(f"{miss_itd} ITD missing")
+        if miss_ou:  parts.append(f"{miss_ou} O/U missing")
+        status = " \u2014 ".join(parts)
         if miss_itd or miss_ou:
             status += " (shown blank)"
 
     except Exception as exc:
-        status = f"⚠️ Scrape failed ({exc!s}) — please fill in manually"
+        status = f"\u26a0\ufe0f Scrape failed ({exc!s}) \u2014 please fill in manually"
 
     return results, status
 
@@ -409,7 +366,12 @@ COL_COLOR = {
 }
 
 
-def _render(rows: list, columns: list, widths: dict) -> bytes:
+def _render(rows: list, columns: list, widths: dict, shade_groups: list) -> bytes:
+    """
+    shade_groups: list of ints (one per row).
+      Even value  → SHADE_A (base dark)
+      Odd value   → SHADE_B (dark navy tint)
+    """
     cw = PAD_X * 2 + sum(widths[c] for c in columns)
     ch = PAD_Y * 2 + HDR_H + len(rows) * ROW_H
 
@@ -418,7 +380,7 @@ def _render(rows: list, columns: list, widths: dict) -> bytes:
     hf   = get_font(FONT_HDR)
     bf   = get_font(FONT_BODY)
 
-    # ── Header row ────────────────────────────────────────────────────────────
+    # Header
     x = PAD_X
     for col in columns:
         w = widths[col]
@@ -432,13 +394,14 @@ def _render(rows: list, columns: list, widths: dict) -> bytes:
         fill="#444444", width=1
     )
 
-    # ── Data rows ────────────────────────────────────────────────────────────
+    # Data rows
     for i, row in enumerate(rows):
         ry = PAD_Y + HDR_H + i * ROW_H
-        if i % 2 == 1:
+        sg = shade_groups[i] if i < len(shade_groups) else i
+        if sg % 2 == 1:
             draw.rectangle(
                 [(PAD_X, ry), (cw - PAD_X, ry + ROW_H)],
-                fill=ROW_ALT
+                fill=SHADE_B
             )
         x = PAD_X
         for col in columns:
@@ -474,10 +437,16 @@ def _render(rows: list, columns: list, widths: dict) -> bytes:
 
 
 def make_g1(df: pd.DataFrame) -> bytes:
-    """Graphic 1 — card order, 7 columns."""
+    """Graphic 1 — card order, 7 columns, shaded by fight pair."""
     d = df.copy()
-    d["_fn"] = pd.to_numeric(d["Fight"], errors="coerce").fillna(999)
-    d = d.sort_values(["_fn", "Salary"], ascending=[True, False]).drop(columns="_fn")
+    d["_fn"] = pd.to_numeric(d["Fight"], errors="coerce").fillna(999).astype(int)
+    d = d.sort_values(["_fn", "Salary"], ascending=[True, False]).reset_index(drop=True)
+    # Alternate shade by fight number: fight 1 = group 0, fight 2 = group 1, etc.
+    shade_groups = [
+        (int(row["_fn"]) - 1) % 2 if row["_fn"] != 999 else i % 2
+        for i, (_, row) in enumerate(d.iterrows())
+    ]
+    d = d.drop(columns="_fn")
     widths = {
         "Fight": 65, "Fighter": 250, "Salary": 90,
         "Win": 85, "ITD": 85, "Rds": 70, "O/U": 80,
@@ -485,13 +454,14 @@ def make_g1(df: pd.DataFrame) -> bytes:
     return _render(
         d.to_dict("records"),
         ["Fight", "Fighter", "Salary", "Win", "ITD", "Rds", "O/U"],
-        widths,
+        widths, shade_groups,
     )
 
 
 def make_g2(df: pd.DataFrame) -> bytes:
-    """Graphic 2 — salary descending, 5 columns (no Rds / O/U)."""
-    d = df.sort_values("Salary", ascending=False).copy()
+    """Graphic 2 — salary descending, 5 columns, alternating row shade."""
+    d = df.sort_values("Salary", ascending=False).copy().reset_index(drop=True)
+    shade_groups = list(range(len(d)))  # every row alternates
     widths = {
         "Fight": 65, "Fighter": 260, "Salary": 90,
         "Win": 90, "ITD": 90,
@@ -499,7 +469,7 @@ def make_g2(df: pd.DataFrame) -> bytes:
     return _render(
         d.to_dict("records"),
         ["Fight", "Fighter", "Salary", "Win", "ITD"],
-        widths,
+        widths, shade_groups,
     )
 
 
@@ -508,16 +478,16 @@ def make_g2(df: pd.DataFrame) -> bytes:
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="UFC DK Graphic Generator",
-    page_icon="🥊",
+    page_icon="\U0001f94a",
     layout="wide",
 )
 st.title("UFC DraftKings Friday Graphic Generator")
 
-# Kick off Playwright Chromium install in background (cached)
+# Kick off Playwright Chromium install (cached — blocks until done on first run)
 ensure_playwright()
 
 # ── 1 · Upload CSV ───────────────────────────────────────────────────────────
-st.markdown("### 1 · Upload DraftKings Salary CSV")
+st.markdown("### 1 \u00b7 Upload DraftKings Salary CSV")
 uploaded = st.file_uploader("Choose DKSalaries.csv", type=["csv"])
 
 if uploaded:
@@ -528,23 +498,23 @@ if uploaded:
         try:
             st.session_state.df     = parse_dk_csv(uploaded)
             st.session_state._fname = uploaded.name
-            st.session_state.pop("scrape_status", None)
-            st.session_state.pop("g1", None)
-            st.session_state.pop("g2", None)
+            # Clear downstream state so editor reinitialises with fresh data
+            for k in ("scrape_status", "g1", "g2", "data_editor"):
+                st.session_state.pop(k, None)
         except Exception as e:
             st.error(f"CSV error: {e}")
             st.stop()
 
 # ── 2 · Scrape ───────────────────────────────────────────────────────────────
 if "df" in st.session_state:
-    st.markdown("### 2 · Scrape Odds from FightOdds.io")
+    st.markdown("### 2 \u00b7 Scrape Odds from FightOdds.io")
     st.caption(
         "Scrapes BetOnline moneyline (Win), ITD, and O/U odds for the next UFC event. "
-        "Results auto-fill the table below — edit anything that looks wrong."
+        "Results auto-fill the table below \u2014 edit anything that looks wrong."
     )
 
-    if st.button("🔍 Scrape Odds", type="primary"):
-        with st.spinner("Launching Chromium · scraping fightodds.io…"):
+    if st.button("\U0001f50d Scrape Odds", type="primary"):
+        with st.spinner("Launching Chromium \u00b7 scraping fightodds.io\u2026"):
             odds, status = scrape_fightodds(
                 st.session_state.df["Fighter"].tolist()
             )
@@ -559,19 +529,32 @@ if "df" in st.session_state:
                 df.at[i, "ITD"]   = o["itd"]
                 df.at[i, "Rds"]   = o["rds"]
                 df.at[i, "O/U"]   = o["ou"]
+        # Update base data AND force editor to reinitialise with scraped values
         st.session_state.df = df
+        st.session_state.pop("data_editor", None)
 
     if s := st.session_state.get("scrape_status"):
-        (st.success if "✅" in s else st.warning)(s)
+        (st.success if "\u2705" in s else st.warning)(s)
 
-# ── 3 · Editable Table ───────────────────────────────────────────────────────
+# ── 3 · Editable Table  +  4 · Generate Graphics (same block so `edited` is in scope)
+# ─────────────────────────────────────────────────────────────────────────────
+# ROOT CAUSE OF REVERT BUG (now fixed):
+#   Previously we did `st.session_state.df = edited` after every edit.
+#   Streamlit interprets any change to the data passed into st.data_editor as
+#   "new data" and reinitialises the widget — discarding the user's sort and
+#   any pending keystrokes.  Fix: never reassign session_state.df during normal
+#   editing.  The editor owns its own state (via key="data_editor").  We only
+#   read `edited` (the live snapshot) when generating graphics.
+# ──────────────────────────────────────────────────────────────────────────────
 if "df" in st.session_state:
-    st.markdown("### 3 · Review & Edit")
+    st.markdown("### 3 \u00b7 Review & Edit")
     st.caption(
         "Fight 1 = main event, Fight 2 = co-main, etc.  "
-        "Enter odds without the +/− — the app adds formatting when generating."
+        "Click any column header to sort.  Edits and sort order persist between reruns."
     )
 
+    # Pass st.session_state.df as the stable base; do NOT overwrite it here.
+    # The editor tracks all user edits internally via key="data_editor".
     edited = st.data_editor(
         st.session_state.df,
         use_container_width=True,
@@ -580,8 +563,7 @@ if "df" in st.session_state:
             "Fight":   st.column_config.TextColumn("Fight",   width=70),
             "Fighter": st.column_config.TextColumn("Fighter", disabled=True, width=200),
             "Salary":  st.column_config.NumberColumn(
-                "Salary", disabled=True, width=90, format="%d"
-            ),
+                           "Salary", disabled=True, width=90, format="%d"),
             "Win":     st.column_config.TextColumn("Win",  width=80),
             "ITD":     st.column_config.TextColumn("ITD",  width=80),
             "Rds":     st.column_config.TextColumn("Rds",  width=70),
@@ -589,38 +571,36 @@ if "df" in st.session_state:
         },
         key="data_editor",
     )
-    st.session_state.df = edited
+    # `edited` is always the current live state of the table (base + all edits).
+    # We use it directly for generation — no session_state reassignment needed.
 
-# ── 4 · Generate Graphics ────────────────────────────────────────────────────
-if "df" in st.session_state:
-    st.markdown("### 4 · Generate Graphics")
+    st.markdown("### 4 \u00b7 Generate Graphics")
 
-    if st.button("🎨 Generate Graphics", type="primary"):
-        df = st.session_state.df.copy()
-        # Normalise +/− on odds columns
+    if st.button("\U0001f3a8 Generate Graphics", type="primary"):
+        df = edited.copy()          # snapshot everything the user has entered
         for col in ("Win", "ITD", "O/U"):
             df[col] = df[col].apply(fmt_odds)
-        with st.spinner("Rendering images…"):
+        with st.spinner("Rendering images\u2026"):
             st.session_state.g1 = make_g1(df)
             st.session_state.g2 = make_g2(df)
 
     if "g1" in st.session_state:
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("Graphic 1 — Card Order")
+            st.subheader("Graphic 1 \u2014 Card Order")
             st.image(st.session_state.g1)
             st.download_button(
-                "⬇ Download Graphic 1",
+                "\u2b07 Download Graphic 1",
                 data=st.session_state.g1,
                 file_name="ufc_salaries_card_order.png",
                 mime="image/png",
                 key="dl1",
             )
         with c2:
-            st.subheader("Graphic 2 — Sorted by Salary")
+            st.subheader("Graphic 2 \u2014 Sorted by Salary")
             st.image(st.session_state.g2)
             st.download_button(
-                "⬇ Download Graphic 2",
+                "\u2b07 Download Graphic 2",
                 data=st.session_state.g2,
                 file_name="ufc_salaries_by_salary.png",
                 mime="image/png",
