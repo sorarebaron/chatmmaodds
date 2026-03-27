@@ -26,7 +26,7 @@ BG       = "#1a1a1a"
 ORANGE   = "#F6770E"
 GREEN    = "#61B50E"
 WHITE    = "#FFFFFF"
-SHADE_B  = "#1d2535"   # highlighted fight rows (odd fight numbers)
+SHADE_B  = "#1d2535"   # highlighted fight rows
 DIV_LINE = "#2e2e2e"
 
 BOOK_PRIORITY = ["BetOnline","DraftKings","FanDuel","BetMGM","Caesars","BetRivers","Bovada"]
@@ -80,7 +80,7 @@ def parse_dk_csv(f) -> pd.DataFrame:
         raise ValueError(f"Need 'Name' and 'Salary' columns. Found: {list(df.columns)}")
     n = len(df)
     return pd.DataFrame({
-        "Fight":   [float("nan")] * n,          # float so NumberColumn sorts numerically
+        "Fight":   [float("nan")] * n,
         "Fighter": df[nc].astype(str).str.strip(),
         "Salary":  pd.to_numeric(df[sc], errors="coerce").fillna(0).astype(int),
         "Win":     [""] * n,
@@ -115,23 +115,19 @@ def scrape_fightodds(dk_names: list) -> tuple:
                 ),
                 viewport={"width": 1280, "height": 800},
             )
-            # Mask webdriver flag to reduce bot detection
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
             page = ctx.new_page()
 
-            # ── Find the next UFC event ──────────────────────────────────────
             page.goto("https://fightodds.io/upcoming-mma-events/ufc", timeout=30000)
             page.wait_for_load_state("domcontentloaded", timeout=15000)
-            # Wait up to 10s for any <a href> to appear (React render)
             try:
                 page.wait_for_selector("a[href]", timeout=10000)
             except Exception:
                 pass
             page.wait_for_timeout(3000)
 
-            # Multi-strategy event link extraction
             event_url = None
             for sel in ["a[href*='/events/']", "a[href*='/event/']", "a[href*='ufc']"]:
                 links = page.locator(sel).all()
@@ -144,7 +140,6 @@ def scrape_fightodds(dk_names: list) -> tuple:
                         )
                         break
 
-            # JS fallback: get every <a href> and pick the first event-like one
             if not event_url:
                 hrefs = page.evaluate("""
                     () => [...document.querySelectorAll('a[href]')]
@@ -161,15 +156,13 @@ def scrape_fightodds(dk_names: list) -> tuple:
             if not event_url:
                 raise RuntimeError(
                     "Could not find a UFC event link on fightodds.io. "
-                    "The site may be blocking the scraper — please fill in manually."
+                    "The site may be blocking the scraper \u2014 please fill in manually."
                 )
 
-            # ── Load event page ──────────────────────────────────────────────
             page.goto(event_url, timeout=30000)
             page.wait_for_load_state("domcontentloaded", timeout=15000)
-            page.wait_for_timeout(6000)   # give React time to render odds table
+            page.wait_for_timeout(6000)
 
-            # Try to expand props sections
             for sel in ["button[aria-label*='prop']","[class*='prop'] button",
                         "button:has-text('Props')","[class*='expand']"]:
                 try:
@@ -316,8 +309,6 @@ COL_COLOR = {
 
 
 def _cell_txt(col, val) -> str:
-    """Convert a cell value to display string."""
-    # Treat NaN / None / empty as blank (non-odds cols) or n/a (odds cols)
     try:
         is_null = (val is None) or pd.isna(val)
     except Exception:
@@ -344,7 +335,6 @@ def _render(rows: list, columns: list, widths: dict, shade_groups: list) -> byte
     draw = ImageDraw.Draw(img)
     hf, bf = get_font(FONT_HDR), get_font(FONT_BODY)
 
-    # Header
     x = PAD_X
     for col in columns:
         w = widths[col]
@@ -354,11 +344,10 @@ def _render(rows: list, columns: list, widths: dict, shade_groups: list) -> byte
     draw.line([(PAD_X, PAD_Y + HDR_H), (cw - PAD_X, PAD_Y + HDR_H)],
               fill="#444444", width=1)
 
-    # Rows
     for i, row in enumerate(rows):
         ry = PAD_Y + HDR_H + i * ROW_H
         sg = shade_groups[i] if i < len(shade_groups) else 0
-        if sg % 2 == 1:                              # odd group → navy highlight
+        if sg % 2 == 1:
             draw.rectangle([(PAD_X, ry), (cw - PAD_X, ry + ROW_H)], fill=SHADE_B)
         x = PAD_X
         for col in columns:
@@ -378,12 +367,12 @@ def _render(rows: list, columns: list, widths: dict, shade_groups: list) -> byte
 
 
 def make_g1(df: pd.DataFrame) -> bytes:
-    """Card order — 7 cols — fight-pair shading (fight 1 = highlighted)."""
+    """Card order — 7 cols — fight 1 unshaded, fight 2 shaded, alternating."""
     d = df.copy()
     d["_fn"] = pd.to_numeric(d["Fight"], errors="coerce").fillna(999).astype(int)
     d = d.sort_values(["_fn","Salary"], ascending=[True, False]).reset_index(drop=True)
-    # fight_num % 2: fight 1 → 1 (odd → highlighted), fight 2 → 0, fight 3 → 1 ...
-    shade = [int(r["_fn"]) % 2 if r["_fn"] != 999 else 0
+    # (fight_num - 1) % 2: fight 1 → 0 (unshaded), fight 2 → 1 (shaded), fight 3 → 0 ...
+    shade = [(int(r["_fn"]) - 1) % 2 if r["_fn"] != 999 else 0
              for _, r in d.iterrows()]
     d = d.drop(columns="_fn")
     widths = {"Fight":65,"Fighter":250,"Salary":90,"Win":85,"ITD":85,"Rds":70,"O/U":80}
@@ -393,9 +382,9 @@ def make_g1(df: pd.DataFrame) -> bytes:
 
 
 def make_g2(df: pd.DataFrame) -> bytes:
-    """Salary descending — 5 cols — NO alternating shade."""
+    """Salary descending — 5 cols — no alternating shade."""
     d = df.sort_values("Salary", ascending=False).copy().reset_index(drop=True)
-    shade = [0] * len(d)   # all even → uniform base colour
+    shade = [0] * len(d)
     widths = {"Fight":65,"Fighter":260,"Salary":90,"Win":90,"ITD":90}
     return _render(d.to_dict("records"),
                    ["Fight","Fighter","Salary","Win","ITD"],
@@ -407,7 +396,6 @@ st.set_page_config(page_title="UFC DK Graphic Generator", page_icon="\U0001f94a"
 st.title("UFC DraftKings Friday Graphic Generator")
 ensure_playwright()
 
-# 1 · Upload
 st.markdown("### 1 \u00b7 Upload DraftKings Salary CSV")
 uploaded = st.file_uploader("Choose DKSalaries.csv", type=["csv"])
 if uploaded:
@@ -421,10 +409,9 @@ if uploaded:
             st.error(f"CSV error: {e}")
             st.stop()
 
-# 2 · Scrape
 if "df" in st.session_state:
     st.markdown("### 2 \u00b7 Scrape Odds from FightOdds.io")
-    st.caption("Scrapes BetOnline Win / ITD / O\u2215U odds. Results fill the table — edit anything wrong.")
+    st.caption("Scrapes BetOnline Win / ITD / O\u2215U odds. Results fill the table \u2014 edit anything wrong.")
     if st.button("\U0001f50d Scrape Odds", type="primary"):
         with st.spinner("Launching Chromium \u00b7 scraping fightodds.io\u2026"):
             odds, status = scrape_fightodds(st.session_state.df["Fighter"].tolist())
@@ -433,20 +420,16 @@ if "df" in st.session_state:
         for i, fighter in df["Fighter"].items():
             if fighter in odds:
                 o = odds[fighter]
-                df.at[i,"Fight"] = o["fight_num"]   # stored as float for NumberColumn
+                df.at[i,"Fight"] = o["fight_num"]
                 df.at[i,"Win"]   = o["win"]
                 df.at[i,"ITD"]   = o["itd"]
                 df.at[i,"Rds"]   = o["rds"]
                 df.at[i,"O/U"]   = o["ou"]
         st.session_state.df = df
-        st.session_state.pop("data_editor", None)   # reinit editor with scraped data
+        st.session_state.pop("data_editor", None)
     if s := st.session_state.get("scrape_status"):
         (st.success if "\u2705" in s else st.warning)(s)
 
-# 3 · Edit  +  4 · Generate  (same block so `edited` stays in scope)
-# KEY DESIGN: we never overwrite st.session_state.df during normal editing.
-# The editor owns its own state via key="data_editor".
-# `edited` is always the live snapshot with every user change applied.
 if "df" in st.session_state:
     st.markdown("### 3 \u00b7 Review & Edit")
     st.caption(
@@ -459,7 +442,6 @@ if "df" in st.session_state:
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            # NumberColumn → sorts numerically (fixes 1,10,11 → 1,2,3)
             "Fight":   st.column_config.NumberColumn("Fight",   width=70,
                                                       min_value=1, step=1, format="%d"),
             "Fighter": st.column_config.TextColumn("Fighter",  disabled=True, width=200),
